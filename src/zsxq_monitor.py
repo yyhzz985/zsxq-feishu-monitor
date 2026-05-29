@@ -891,10 +891,10 @@ def multipart_body(fields, files):
 
 
 def get_feishu_tenant_token(post_func=http_post):
-    app_id = runtime_value("FEISHU_APP_ID")
-    app_secret = runtime_value("FEISHU_APP_SECRET")
+    app_id = runtime_value("ZSXQ_FEISHU_APP_ID") or runtime_value("FEISHU_APP_ID")
+    app_secret = runtime_value("ZSXQ_FEISHU_APP_SECRET") or runtime_value("FEISHU_APP_SECRET")
     if not app_id or not app_secret:
-        raise RuntimeError("missing FEISHU_APP_ID or FEISHU_APP_SECRET")
+        raise RuntimeError("missing FEISHU_APP_ID / ZSXQ_FEISHU_APP_ID or FEISHU_APP_SECRET / ZSXQ_FEISHU_APP_SECRET")
     result = http_post_json(
         f"{FEISHU_API_BASE}/auth/v3/tenant_access_token/internal",
         {"app_id": app_id, "app_secret": app_secret},
