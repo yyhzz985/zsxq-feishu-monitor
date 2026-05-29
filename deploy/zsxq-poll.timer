@@ -1,0 +1,13 @@
+[Unit]
+Description=Run ZSXQ to Feishu monitor every minute
+Requires=zsxq-poll.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+Unit=zsxq-poll.service
+
+[Install]
+WantedBy=timers.target

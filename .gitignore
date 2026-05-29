@@ -1,0 +1,40 @@
+# 凭据文件 - 绝对不要提交
+.env
+*.env
+!deploy/zsxq-poll.env
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 锁文件
+*.lock
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+temp/
+*.tmp
+*.pyc
+__pycache__/
+
+# 存档
+archive/
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 部署包
+dist/
+*.zip
