@@ -5,21 +5,24 @@ import re
 import sys
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_FILES = [
-    "zsxq_monitor.py",
-    "setup_server.sh",
-    "zsxq-poll.service",
-    "zsxq-poll.timer",
-    "zsxq-poll.env",
-    "install_windows_task.ps1",
-    "ZSXQ_Feishu_Monitor_部署与切换手册.md",
+    "src/zsxq_monitor.py",
+    "deploy/setup_server.sh",
+    "deploy/zsxq-poll.service",
+    "deploy/zsxq-poll.timer",
+    "deploy/zsxq-poll.env",
+    "deploy/install_windows_task.ps1",
+    "docs/部署与切换手册.md",
 ]
 
 SENSITIVE_PATTERNS = [
-    re.compile(r"ZSXQ_ACCESS_TOKEN=(?!REPLACE_WITH_REAL_TOKEN|不要写进文档)\S+", re.I),
-    re.compile(r"FEISHU_APP_SECRET=(?!REPLACE_WITH_FEISHU_APP_SECRET|your_app_secret|不要写进文档)\S+", re.I),
+    re.compile(r"^\s*ZSXQ_ACCESS_TOKEN=(?!REPLACE_WITH_REAL_TOKEN|REPLACE_WITH_ZSXQ_TOKEN|不要写进文档)\S+", re.I | re.M),
+    re.compile(
+        r"^\s*(?:ZSXQ_)?FEISHU_APP_SECRET=(?!REPLACE_WITH_FEISHU_APP_SECRET|REPLACE_WITH_SYNC_BOT_SECRET|your_app_secret|不要写进文档)\S+",
+        re.I | re.M,
+    ),
     re.compile(r'"access_token"\s*:\s*"[^"]+"', re.I),
 ]
 
@@ -46,7 +49,7 @@ def validate_required_files(errors, messages):
 
 
 def validate_service(errors, messages):
-    service = read_text("zsxq-poll.service")
+    service = read_text("deploy/zsxq-poll.service")
     required = [
         "Type=oneshot",
         "ExecStart=/opt/zsxq-monitor/venv/bin/python /opt/zsxq-monitor/app/zsxq_monitor.py",
@@ -62,7 +65,7 @@ def validate_service(errors, messages):
 
 
 def validate_timer(errors, messages):
-    timer = read_text("zsxq-poll.timer")
+    timer = read_text("deploy/zsxq-poll.timer")
     for text in ("OnUnitActiveSec=1min", "Persistent=true", "Unit=zsxq-poll.service"):
         if text not in timer:
             add_error(errors, f"timer missing: {text}")
@@ -71,9 +74,9 @@ def validate_timer(errors, messages):
 
 
 def validate_env_example(errors, messages):
-    env = read_text("zsxq-poll.env")
+    env = read_text("deploy/zsxq-poll.env")
     required = [
-        "ZSXQ_ACCESS_TOKEN=REPLACE_WITH_REAL_TOKEN",
+        "ZSXQ_ACCESS_TOKEN=REPLACE_WITH_ZSXQ_TOKEN",
         "FEISHU_SEND_MODE=openapi",
         "FEISHU_APP_ID=REPLACE_WITH_FEISHU_APP_ID",
         "FEISHU_APP_SECRET=REPLACE_WITH_FEISHU_APP_SECRET",
@@ -87,11 +90,11 @@ def validate_env_example(errors, messages):
 
 def validate_no_secrets(errors, messages):
     scanned = [
-        "zsxq-poll.env",
-        "setup_server.sh",
-        "zsxq-poll.service",
-        "zsxq-poll.timer",
-        "ZSXQ_Feishu_Monitor_部署与切换手册.md",
+        "deploy/zsxq-poll.env",
+        "deploy/setup_server.sh",
+        "deploy/zsxq-poll.service",
+        "deploy/zsxq-poll.timer",
+        "docs/部署与切换手册.md",
     ]
     leaked = []
     for name in scanned:
@@ -107,7 +110,7 @@ def validate_no_secrets(errors, messages):
 
 
 def validate_main_script(errors, messages):
-    script = read_text("zsxq_monitor.py")
+    script = read_text("src/zsxq_monitor.py")
     required = [
         "with SQLite status tracking",
         "FEISHU_SEND_MODE",

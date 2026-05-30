@@ -85,10 +85,14 @@ ZSXQ_ACCESS_TOKEN=       # 知识星球 Cookie token
 FEISHU_APP_ID=            # 飞书自建应用 App ID
 FEISHU_APP_SECRET=        # 飞书自建应用 App Secret
 FEISHU_CHAT_ID=           # 飞书群 chat_id
+FEISHU_CONTENT_CHAT_IDS=  # 可选，额外内容群，多个用英文逗号分隔
+FEISHU_ALERT_CHAT_ID=     # 可选，测试/告警群；告警和健康日报只发这里
 FEISHU_SEND_MODE=openapi  # 发送模式：openapi 或 cli
 WATERMARK_TEXT=           # 水印文字
 ZSXQ_SAVE_DIR=            # 图片存档目录
 ```
+
+发送规则：星球图片和附件会发到 `FEISHU_CHAT_ID`、`FEISHU_CONTENT_CHAT_IDS`、`FEISHU_ALERT_CHAT_ID`；告警和健康日报只发到 `FEISHU_ALERT_CHAT_ID`。如果没配置 `FEISHU_ALERT_CHAT_ID`，告警会发到 `FEISHU_CHAT_ID`。
 
 ## 已知限制
 

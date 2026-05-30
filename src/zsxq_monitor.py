@@ -120,8 +120,11 @@ def http_post(url, data=None, headers=None, timeout=60):
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout, context=CTX) as resp:
-        return resp.read(), resp.status
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as resp:
+            return resp.read(), resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.read(), exc.code
 
 
 def runtime_value(key, default=""):
@@ -829,6 +832,81 @@ def get_feishu_chat_id():
     return runtime_value("FEISHU_CHAT_ID", FEISHU_CHAT_ID)
 
 
+def split_chat_ids(raw):
+    return [cid.strip() for cid in str(raw or "").split(",") if cid.strip()]
+
+
+def dedupe_chat_ids(chat_ids):
+    result = []
+    seen = set()
+    for cid in chat_ids:
+        if cid and cid not in seen:
+            result.append(cid)
+            seen.add(cid)
+    return result
+
+
+def get_feishu_content_chat_ids():
+    """Return a list of chat IDs from FEISHU_CONTENT_CHAT_IDS (comma-separated)."""
+    return split_chat_ids(runtime_value("FEISHU_CONTENT_CHAT_IDS", ""))
+
+
+def get_feishu_alert_chat_ids():
+    raw = runtime_value("FEISHU_ALERT_CHAT_IDS", "") or runtime_value("FEISHU_ALERT_CHAT_ID", "")
+    alert_ids = split_chat_ids(raw)
+    if alert_ids:
+        return dedupe_chat_ids(alert_ids)
+    primary = get_feishu_chat_id()
+    return [primary] if primary else []
+
+
+def get_feishu_alert_chat_id():
+    chat_ids = get_feishu_alert_chat_ids()
+    return chat_ids[0] if chat_ids else get_feishu_chat_id()
+
+
+def get_all_feishu_chat_ids():
+    """Return all groups that should receive synced ZSXQ content."""
+    primary = get_feishu_chat_id()
+    return dedupe_chat_ids([primary] + get_feishu_content_chat_ids() + get_feishu_alert_chat_ids())
+
+
+def format_feishu_multi_chat_error(failures):
+    parts = []
+    for result in failures:
+        chat_id = result.get("chat_id", "?")
+        error = result.get("error", "unknown error")
+        parts.append(f"{chat_id}: {error}")
+    return "Feishu send failed for chat_ids: " + "; ".join(parts)
+
+
+def send_openapi_to_all_chats(send_func, target, idempotency_key=None, chat_ids=None):
+    results = []
+    for cid in chat_ids if chat_ids is not None else get_all_feishu_chat_ids():
+        key = f"{idempotency_key}_{cid}" if idempotency_key else None
+        result = dict(send_func(target, idempotency_key=key, chat_id=cid) or {})
+        result["chat_id"] = cid
+        results.append(result)
+
+    if not results:
+        return {"ok": False, "message_id": "", "error": "no chat_ids configured", "results": []}
+
+    failures = [r for r in results if not r.get("ok")]
+    for result in failures:
+        log_msg(f"SEND_FAILED to {result.get('chat_id','?')}: {result.get('error','')[:200]}")
+    if failures:
+        return {
+            "ok": False,
+            "message_id": "",
+            "error": format_feishu_multi_chat_error(failures),
+            "results": results,
+        }
+
+    first = dict(results[0])
+    first["results"] = results
+    return first
+
+
 def parse_feishu_api_result(status, body):
     text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body or "")
     try:
@@ -1037,7 +1115,7 @@ def feishu_send_text_openapi(text, idempotency_key=None, tenant_token=None, chat
 
 def fs_send_image(filepath, idempotency_key=None):
     if get_feishu_send_mode() == "openapi":
-        return feishu_send_image_openapi(filepath, idempotency_key)
+        return send_openapi_to_all_chats(feishu_send_image_openapi, filepath, idempotency_key)
     return run_lark_cli(
         with_idempotency(
             ["im", "+messages-send", "--as", "bot", "--chat-id", get_feishu_chat_id(), "--image", os.path.basename(filepath)],
@@ -1050,7 +1128,7 @@ def fs_send_image(filepath, idempotency_key=None):
 
 def fs_send_file(filepath, idempotency_key=None):
     if get_feishu_send_mode() == "openapi":
-        return feishu_send_file_openapi(filepath, idempotency_key)
+        return send_openapi_to_all_chats(feishu_send_file_openapi, filepath, idempotency_key)
     return run_lark_cli(
         with_idempotency(
             ["im", "+messages-send", "--as", "bot", "--chat-id", get_feishu_chat_id(), "--file", os.path.basename(filepath)],
@@ -1063,10 +1141,15 @@ def fs_send_file(filepath, idempotency_key=None):
 
 def fs_send_text(text, idempotency_key=None):
     if get_feishu_send_mode() == "openapi":
-        return feishu_send_text_openapi(text, idempotency_key)
+        return send_openapi_to_all_chats(
+            feishu_send_text_openapi,
+            text,
+            idempotency_key,
+            chat_ids=get_feishu_alert_chat_ids(),
+        )
     return run_lark_cli(
         with_idempotency(
-            ["im", "+messages-send", "--as", "bot", "--chat-id", get_feishu_chat_id(), "--text", text],
+            ["im", "+messages-send", "--as", "bot", "--chat-id", get_feishu_alert_chat_id(), "--text", text],
             idempotency_key,
         ),
         30,
