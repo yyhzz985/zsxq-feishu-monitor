@@ -1,0 +1,13 @@
+[Unit]
+Description=Run ZSXQ ggggg monitor every 3 minutes
+Requires=zsxq-poll-ggggg.service
+
+[Timer]
+OnBootSec=70s
+OnUnitActiveSec=3min
+AccuracySec=10s
+Persistent=true
+Unit=zsxq-poll-ggggg.service
+
+[Install]
+WantedBy=timers.target

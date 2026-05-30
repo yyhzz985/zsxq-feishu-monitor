@@ -1,0 +1,23 @@
+[Unit]
+Description=ZSXQ to Feishu monitor (开kkkkkkk史)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/zsxq-monitor-kkkkk/app
+Environment=ZSXQ_CONFIG_FILE=/opt/zsxq-monitor-kkkkk/config/config.json
+Environment=ZSXQ_DB_FILE=/opt/zsxq-monitor-kkkkk/data/zsxq_monitor.db
+Environment=ZSXQ_LOCK_FILE=/opt/zsxq-monitor-kkkkk/data/zsxq_monitor.lock
+Environment=ZSXQ_ENV_FILE=/opt/zsxq-monitor-kkkkk/config/.env
+Environment=ZSXQ_LOG_DIR=/var/log/zsxq-monitor
+Environment=ZSXQ_TEMP_DIR=/opt/zsxq-monitor-kkkkk/temp
+EnvironmentFile=/opt/zsxq-monitor-kkkkk/config/.env
+ExecStart=/opt/zsxq-monitor/venv/bin/python /opt/zsxq-monitor-kkkkk/app/zsxq_monitor.py
+RuntimeMaxSec=5min
+
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes

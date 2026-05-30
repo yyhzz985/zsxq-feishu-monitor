@@ -1,0 +1,13 @@
+[Unit]
+Description=Run ZSXQ kkkkk monitor every 4 minutes
+Requires=zsxq-poll-kkkkk.service
+
+[Timer]
+OnBootSec=100s
+OnUnitActiveSec=4min
+AccuracySec=10s
+Persistent=true
+Unit=zsxq-poll-kkkkk.service
+
+[Install]
+WantedBy=timers.target

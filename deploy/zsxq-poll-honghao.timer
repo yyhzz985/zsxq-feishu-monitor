@@ -1,0 +1,13 @@
+[Unit]
+Description=Run ZSXQ Honghao monitor every 5 minutes
+Requires=zsxq-poll-honghao.service
+
+[Timer]
+OnBootSec=40s
+OnUnitActiveSec=5min
+AccuracySec=10s
+Persistent=true
+Unit=zsxq-poll-honghao.service
+
+[Install]
+WantedBy=timers.target
