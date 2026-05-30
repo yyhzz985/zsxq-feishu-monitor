@@ -1176,14 +1176,14 @@ def notes_import_image(filepath):
     return ""
 
 
-def notes_export(markdown_text):
+def notes_export(markdown_text, footer_brand="击球区小能手的星球"):
     data, status = http_post(
         NOTES_EXPORT,
         json.dumps(
             {
                 "markdown": markdown_text,
                 "theme": "default",
-                "footerBrand": "击球区小能手的星球",
+                "footerBrand": footer_brand,
                 "footerVia": "",
             }
         ).encode(),
@@ -1292,7 +1292,7 @@ def extract_topic_content(topic):
     return text, images, files
 
 
-def render_topic_note(topic, ztok):
+def render_topic_note(topic, ztok, group_name=None):
     text, images, files = extract_topic_content(topic)
     ctime_raw = topic.get("create_time", "")
     ctime = ctime_raw[:16].replace("T", " ")
@@ -1330,7 +1330,8 @@ def render_topic_note(topic, ztok):
         md_parts.append("\n📎 " + "、".join(file_names))
 
     md_text = "\n\n".join(md_parts)
-    note_png = notes_export(md_text)
+    footer = group_name or "击球区小能手的星球"
+    note_png = notes_export(md_text, footer_brand=footer)
     note_png = add_watermark(note_png)
 
     save_dir = get_save_dir(ctime_raw)
@@ -1341,13 +1342,13 @@ def render_topic_note(topic, ztok):
     return save_path, files
 
 
-def process_topic_record(conn, record, ztok):
+def process_topic_record(conn, record, ztok, group_name=None):
     tid = record["topic_id"]
     archive_path = record.get("archive_path")
 
     if not archive_path or not os.path.exists(archive_path):
         topic = json.loads(record["topic_json"])
-        save_path, files = render_topic_note(topic, ztok)
+        save_path, files = render_topic_note(topic, ztok, group_name=group_name)
         upsert_file_records(conn, tid, topic.get("create_time", ""), files)
         mark_topic_rendered(conn, tid, save_path)
         archive_path = save_path
@@ -1363,12 +1364,12 @@ def process_topic_record(conn, record, ztok):
     return False
 
 
-def process_pending_topics(conn, ztok):
+def process_pending_topics(conn, ztok, group_name=None):
     sent = 0
     failed = 0
     for record in get_pending_topics(conn):
         try:
-            if process_topic_record(conn, record, ztok):
+            if process_topic_record(conn, record, ztok, group_name=group_name):
                 sent += 1
             else:
                 failed += 1
@@ -1385,7 +1386,7 @@ def process_pending_files(conn, ztok):
     failed = 0
     for record in get_pending_files(conn):
         key = record["file_key"]
-        local = os.path.join(TEMP_DIR, f"{record['topic_id']}_{safe_filename(record['name'])}")
+        local = os.path.join(TEMP_DIR, safe_filename(record["name"]))
         try:
             dl_url = zsxq_file_dl(record["file_id"], ztok)
             if not dl_url:
@@ -1595,6 +1596,7 @@ def run_monitor(dry_run=False):
             cfg = json.load(f)
         env = load_env()
         gid = cfg["group_id"]
+        footer_brand = cfg.get("footer_brand") or cfg.get("group_name", "击球区小能手的星球")
         ztok = env.get("ZSXQ_ACCESS_TOKEN") or cfg.get("access_token")
         if not ztok:
             if dry_run:
@@ -1653,7 +1655,7 @@ def run_monitor(dry_run=False):
                 "page limit reached"
             )
 
-        topic_sent, topic_failed = process_pending_topics(conn, ztok)
+        topic_sent, topic_failed = process_pending_topics(conn, ztok, group_name=footer_brand)
         file_sent, file_failed = process_pending_files(conn, ztok)
         set_meta(conn, "last_heartbeat", now_text())
         try:
