@@ -700,13 +700,12 @@ class FileLock:
 
 # ---- Watermark ----
 def add_watermark(image_bytes):
-    """Add full-screen repeating diagonal watermark."""
+    """Add full-screen repeating diagonal watermark. Memory-optimized: RGB + direct tile paste (no full-size overlay)."""
     import io as _io
 
     buf_in = _io.BytesIO(image_bytes)
-    img = Image.open(buf_in).convert("RGBA")
+    img = Image.open(buf_in).convert("RGB")
     W, H = img.size
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 
     try:
         font = ImageFont.truetype("simhei.ttf", max(22, W // 35))
@@ -734,13 +733,11 @@ def add_watermark(image_bytes):
     spacing_y = rt_h + min(300, max(30, H // 8))
     for y in range(-rt_h, H + rt_h, spacing_y):
         for x in range(-rt_w, W + rt_w, spacing_x):
-            overlay.paste(tile, (x, y), tile)
+            img.paste(tile, (x, y), tile)
 
-    result = Image.alpha_composite(img, overlay).convert("RGB")
     buf_out = _io.BytesIO()
-    result.save(buf_out, format="PNG")
+    img.save(buf_out, format="PNG")
     return buf_out.getvalue()
-
 
 # ---- Feishu (lark-cli) ----
 import subprocess as _subprocess
@@ -1415,6 +1412,20 @@ def render_topic_note(topic, ztok, group_name=None):
     md_text = "\n\n".join(md_parts)
     footer = group_name or "击球区小能手的星球"
     note_png = notes_export(md_text, footer_brand=footer)
+
+    # Pre-resize to reduce memory for watermark (critical on 2GB servers)
+    import io as _io
+    _tmp_img = Image.open(_io.BytesIO(note_png))
+    _w, _h = _tmp_img.size
+    if _w > 1200:
+        _ratio = 1200 / _w
+        _tmp_img = _tmp_img.resize((1200, int(_h * _ratio)), Image.LANCZOS)
+        _buf = _io.BytesIO()
+        _tmp_img.save(_buf, format='PNG')
+        note_png = _buf.getvalue()
+        _buf.close()
+    _tmp_img.close()
+
     note_png = add_watermark(note_png)
 
     save_dir = get_save_dir(ctime_raw)
