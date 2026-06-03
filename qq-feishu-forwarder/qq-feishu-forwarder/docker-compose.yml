@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    environment:
+      - ACCOUNT=你的QQ号        # ← 替换成你的QQ号
+      - NAPCAT_GID=0
+      - NAPCAT_UID=0
+    ports:
+      - "6099:6099"             # WebUI 管理界面
+      - "3001:3001"             # WebSocket 正向连接端口
+    volumes:
+      - ./napcat_data:/app/.config/QQ
+    restart: unless-stopped
+    networks:
+      - forwarder-net
+
+  forwarder:
+    build: ./forwarder
+    container_name: qq-feishu-forwarder
+    environment:
+      - NAPCAT_WS=ws://napcat:3001
+      - FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/替换成你的token
+      - TARGET_GROUP_ID=替换成要监控的QQ群号
+      - FEISHU_SECRET=        # 飞书机器人安全签名，没开启则留空
+    restart: unless-stopped
+    depends_on:
+      - napcat
+    networks:
+      - forwarder-net
+
+networks:
+  forwarder-net:
+    driver: bridge

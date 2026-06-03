@@ -103,7 +103,7 @@ EOFCFG
     
     # .env file (fill in real values after setup!)
     cat > "$INST_DIR/config/.env" << EOFENV
-ZSXQ_ACCESS_TOKEN=REPLACE_WITH_YOUR_ZSXQ_TOKEN
+ZSXQ_ACCESS_TOKEN=REPLACE_WITH_ZSXQ_TOKEN
 ZSXQ_SAVE_DIR=/data/zsxq-archive/$GNAME
 WATERMARK_TEXT=更新加V：237219265
 FEISHU_SEND_MODE=openapi

@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# OSS integration (disabled by default; set ZSXQ_OSS_ENABLED=1 in .env)
+try:
+    from . import oss_helpers as _oss
+    _oss.OSS_ENABLED = is_truthy(os.environ.get("ZSXQ_OSS_ENABLED", "0"))
+    _oss.OSS_BUCKET = os.environ.get("ZSXQ_OSS_BUCKET", "")
+    _oss.OSS_ENDPOINT = os.environ.get("ZSXQ_OSS_ENDPOINT", "oss-cn-hangzhou-internal.aliyuncs.com")
+    _oss.OSS_ACCESS_KEY_ID = os.environ.get("ZSXQ_OSS_ACCESS_KEY_ID", "")
+    _oss.OSS_ACCESS_KEY_SECRET = os.environ.get("ZSXQ_OSS_ACCESS_KEY_SECRET", "")
+except ImportError:
+    _oss = None
 """ZSXQ -> note image -> watermark -> Feishu, with SQLite status tracking."""
 import json
 import mimetypes
@@ -54,6 +64,9 @@ PENDING_TOPIC_LIMIT = 100
 PENDING_FILE_LIMIT = 100
 ALERT_FAILURE_THRESHOLD = 3
 DISK_ALERT_FREE_BYTES = int(os.environ.get("ZSXQ_DISK_ALERT_GB", "10")) * 1024 * 1024 * 1024
+FEISHU_FILE_MAX_SIZE = int(os.environ.get("ZSXQ_FEISHU_FILE_MAX_MB", "30")) * 1024 * 1024
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".wma", ".opus", ".amr", ".m4b"}
+FILE_MAX_RETRIES = int(os.environ.get("ZSXQ_FILE_MAX_RETRIES", "5"))
 
 
 def now_text():
@@ -796,8 +809,9 @@ def run_lark_cli(args, timeout, cwd=None):
     try:
         r = _subprocess.run(
             [LARK_CLI] + args,
-            capture_output=True,
-            text=True,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.PIPE,
+            universal_newlines=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
@@ -849,10 +863,20 @@ def get_feishu_content_chat_ids():
 
 
 def get_feishu_alert_chat_ids():
+    """Return chat IDs for alert messages.
+
+    Priority: explicit FEISHU_ALERT_CHAT_IDS > content/test groups > primary.
+    Alerts go to test groups by default, NOT to formal content groups.
+    """
     raw = runtime_value("FEISHU_ALERT_CHAT_IDS", "") or runtime_value("FEISHU_ALERT_CHAT_ID", "")
     alert_ids = split_chat_ids(raw)
     if alert_ids:
         return dedupe_chat_ids(alert_ids)
+    # Fallback: use content/test groups instead of primary formal group
+    content_ids = get_feishu_content_chat_ids()
+    if content_ids:
+        return content_ids
+    # Last resort: primary formal group
     primary = get_feishu_chat_id()
     return [primary] if primary else []
 
@@ -863,9 +887,13 @@ def get_feishu_alert_chat_id():
 
 
 def get_all_feishu_chat_ids():
-    """Return all groups that should receive synced ZSXQ content."""
+    """Return all groups that should receive synced ZSXQ content.
+
+    Alert chat IDs are NOT included here. Alerts route separately via
+    fs_send_text -> get_feishu_alert_chat_ids -> test groups.
+    """
     primary = get_feishu_chat_id()
-    return dedupe_chat_ids([primary] + get_feishu_content_chat_ids() + get_feishu_alert_chat_ids())
+    return dedupe_chat_ids([primary] + get_feishu_content_chat_ids())
 
 
 def format_feishu_multi_chat_error(failures):
@@ -1183,7 +1211,7 @@ def zsxq_image_url(image_id, token):
         try:
             data = zsxq_req(f"https://api.zsxq.com/v2/images/{image_id}", token)
             if not data.get("succeeded"):
-                wait = 2.0 if data.get("code") == 1059 else 0.5
+                wait = 10.0 * (attempt + 1) if data.get("code") == 1059 else 0.5
                 if attempt < 4:
                     time.sleep(wait)
                 continue
@@ -1344,9 +1372,12 @@ def compress_for_feishu(note_png, save_path):
     with open(save_path_jpg, "wb") as f:
         f.write(best)
     return save_path_jpg, best
+def extract_topic_content(topic, include_reference=True):
+    """Extract text, images, files from a topic.
 
-
-def extract_topic_content(topic):
+    If include_reference and the topic has a referenced_topic, append the
+    referenced content after the main text with a separator.
+    """
     topic_type = topic.get("type", "talk")
     text = ""
     images = []
@@ -1368,6 +1399,45 @@ def extract_topic_content(topic):
         text = strip_html(talk.get("text", ""))
         images = talk.get("images", [])
         files = talk.get("files", [])
+
+    # Handle referenced_topic: include quoted content
+    if include_reference:
+        ref_wrapper = topic.get("referenced_topic", {})
+        ref_topic = ref_wrapper.get("topic") if isinstance(ref_wrapper, dict) else None
+        if ref_topic:
+            ref_text, ref_images, ref_files = extract_topic_content(
+                ref_topic, include_reference=False
+            )
+            ref_time = (ref_topic.get("create_time", "") or "")[:16].replace("T", " ")
+            ref_label = f"📌 引用原文 ({ref_time})"
+            ref_block = ref_label
+            if ref_text:
+                ref_block = ref_label + "\n" + ref_text
+
+            # Add referenced file info to text
+            ref_file_lines = []
+            for fitem in ref_files:
+                fname = fitem.get("name", "")
+                if not fname:
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in AUDIO_EXTENSIONS:
+                    ftime = (fitem.get("create_time", "") or "")[:16].replace("-", "").replace("T", "").replace(":", "")
+                    if ftime:
+                        ref_file_lines.append(f"[{ftime}_音频]")
+                    else:
+                        ref_file_lines.append(f"[音频] {fname}")
+                else:
+                    ref_file_lines.append(f"📎 {fname}")
+            if ref_file_lines:
+                ref_block = ref_block + "\n" + "\n".join(ref_file_lines)
+
+            if text:
+                text = text + "\n\n---\n\n" + ref_block
+            else:
+                text = ref_block
+            images = images + ref_images
+            files = files + ref_files
 
     return text, images, files
 
@@ -1405,7 +1475,20 @@ def render_topic_note(topic, ztok, group_name=None):
     for url in img_urls:
         md_parts.append(f"![image]({url})")
 
-    file_names = [item.get("name", "") for item in files if item.get("name")]
+    file_names = []
+    for item in files:
+        fname = item.get("name", "")
+        if not fname:
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in AUDIO_EXTENSIONS:
+            ftime = (item.get("create_time", "") or "")[:16].replace("-", "").replace("T", "").replace(":", "")
+            if ftime:
+                file_names.append(f"[{ftime}_音频]")
+            else:
+                file_names.append(fname)
+        else:
+            file_names.append(fname)
     if file_names:
         md_parts.append("\n📎 " + "、".join(file_names))
 
@@ -1429,10 +1512,19 @@ def render_topic_note(topic, ztok, group_name=None):
     note_png = add_watermark(note_png)
 
     save_dir = get_save_dir(ctime_raw)
-    save_path = os.path.join(save_dir, make_note_name(ctime_raw))
+    note_name = make_note_name(ctime_raw)
+    save_path = os.path.join(save_dir, note_name)
     with open(save_path, "wb") as f:
         f.write(note_png)
     save_path, _ = compress_for_feishu(note_png, save_path)
+
+    # Upload to OSS after local save
+    if _oss and _oss.OSS_ENABLED and _oss.OSS_BUCKET:
+        date_str = ctime_raw[:10].replace("-", "")
+        oss_key = _oss.oss_key_for_archive(group_name or "unknown", date_str, os.path.basename(save_path))
+        if _oss.oss_upload(save_path, oss_key, log_func=log_msg):
+            save_path = f"oss://{_oss.OSS_BUCKET}/{oss_key}"
+
     return save_path, files
 
 
@@ -1440,14 +1532,27 @@ def process_topic_record(conn, record, ztok, group_name=None):
     tid = record["topic_id"]
     archive_path = record.get("archive_path")
 
-    if not archive_path or not os.path.exists(archive_path):
-        topic = json.loads(record["topic_json"])
-        save_path, files = render_topic_note(topic, ztok, group_name=group_name)
+    local_missing = not archive_path or (
+        not archive_path.startswith("oss://") and not os.path.exists(archive_path)
+    )
+    if local_missing:
+        if archive_path and archive_path.startswith("oss://") and _oss and _oss.OSS_ENABLED:
+            local_copy = os.path.join(TEMP_DIR, os.path.basename(archive_path))
+            if _oss.oss_download(archive_path.replace(f"oss://{_oss.OSS_BUCKET}/", ""), local_copy, log_func=log_msg):
+                archive_path = local_copy
+            else:
+                archive_path = None
+        if not archive_path or (not archive_path.startswith("oss://") and not os.path.exists(archive_path)):
+            topic = json.loads(record["topic_json"])
+            save_path, files = render_topic_note(topic, ztok, group_name=group_name)
         upsert_file_records(conn, tid, topic.get("create_time", ""), files)
         mark_topic_rendered(conn, tid, save_path)
         archive_path = save_path
 
-    result = fs_send_image(archive_path, idempotency_key=f"zsxq-topic-{topic_id_key(tid)}")
+    # Always include timestamp in idempotency key so every send attempt is
+    # unique — prevents Feishu from returning cached old results on re-renders
+    idem_key = f"zsxq-topic-{topic_id_key(tid)}-v{int(time.time())}"
+    result = fs_send_image(archive_path, idempotency_key=idem_key)
     if result["ok"]:
         mark_topic_sent(conn, tid, archive_path, result.get("message_id"))
         log_msg(f"TOPIC_SENT: {tid} {archive_path}")
@@ -1475,12 +1580,77 @@ def process_pending_topics(conn, ztok, group_name=None):
     return sent, failed
 
 
+def compress_audio_for_feishu(filepath, max_size=FEISHU_FILE_MAX_SIZE):
+    """Re-encode audio file to fit within Feishu file size limit using ffmpeg."""
+    import subprocess as _sp
+
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        raise ValueError(f"Not an audio file: {ext}")
+
+    orig_size = os.path.getsize(filepath)
+    if orig_size <= max_size:
+        return filepath, False
+
+    try:
+        probe = _sp.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+            stdout=_sp.PIPE, stderr=_sp.PIPE, universal_newlines=True, timeout=30
+        )
+        duration = float(probe.stdout.strip()) if probe.stdout.strip() else None
+    except Exception:
+        duration = None
+
+    if not duration or duration <= 0:
+        raise RuntimeError(f"Cannot determine audio duration for compression: {filepath}")
+
+    target_bytes = int(max_size * 0.9)
+    target_bitrate = max(16, int(target_bytes * 8 / duration / 1000))
+    if target_bitrate > 128:
+        target_bitrate = 128
+    log_msg(f"COMPRESS_AUDIO: {os.path.basename(filepath)} {orig_size/(1024*1024):.1f}MB, "
+            f"duration={duration:.0f}s, target_bitrate={target_bitrate}kbps")
+
+    compressed_path = filepath.rsplit(".", 1)[0] + "_compressed.mp3"
+    result = _sp.run(
+        ["ffmpeg", "-y", "-i", filepath,
+         "-acodec", "libmp3lame", "-b:a", f"{target_bitrate}k",
+         "-ac", "1", "-ar", "22050",
+         compressed_path],
+        stdout=_sp.PIPE, stderr=_sp.PIPE, universal_newlines=True, timeout=300
+    )
+
+    if result.returncode != 0 or not os.path.exists(compressed_path):
+        err = result.stderr[-500:] if result.stderr else "unknown ffmpeg error"
+        raise RuntimeError(f"Audio compression failed: {err}")
+
+    new_size = os.path.getsize(compressed_path)
+    if new_size > max_size:
+        os.remove(compressed_path)
+        raise RuntimeError(
+            f"Compressed audio still too large: {new_size/(1024*1024):.1f}MB > {max_size/(1024*1024)}MB limit"
+        )
+
+    log_msg(f"COMPRESS_AUDIO_OK: {os.path.basename(filepath)} -> "
+            f"{orig_size/(1024*1024):.1f}MB -> {new_size/(1024*1024):.1f}MB")
+    return compressed_path, True
+
+
 def process_pending_files(conn, ztok):
     sent = 0
     failed = 0
     for record in get_pending_files(conn):
         key = record["file_key"]
-        local = os.path.join(TEMP_DIR, safe_filename(record["name"]))
+        # Use formatted name for audio files
+        local_name = safe_filename(record["name"])
+        ext = os.path.splitext(local_name)[1].lower()
+        if ext in AUDIO_EXTENSIONS:
+            ftime = (record.get("create_time", "") or "")[:16].replace("-", "").replace("T", "").replace(":", "")
+            if ftime:
+                local_name = f"{ftime}_音频{ext}"
+        local = os.path.join(TEMP_DIR, local_name)
+        local_to_send = None
         try:
             dl_url = zsxq_file_dl(record["file_id"], ztok)
             if not dl_url:
@@ -1488,12 +1658,46 @@ def process_pending_files(conn, ztok):
             with open(local, "wb") as f:
                 f.write(http_get(dl_url, {"Cookie": f"zsxq_access_token={ztok}; abtest_env=product"}))
             save_dir = get_save_dir(record["create_time"])
-            archive_path = unique_path(save_dir, f"{record['topic_id']}_{safe_filename(record['name'])}")
+            # Rename audio files to {timestamp}_音频{ext} format
+            save_name = safe_filename(record["name"])
+            ext = os.path.splitext(save_name)[1].lower()
+            if ext in AUDIO_EXTENSIONS:
+                ftime = (record.get("create_time", "") or "")[:16].replace("-", "").replace("T", "").replace(":", "")
+                if ftime:
+                    save_name = f"{ftime}_音频{ext}"
+            archive_path = unique_path(save_dir, f"{record['topic_id']}_{save_name}")
             with open(archive_path, "wb") as f:
                 with open(local, "rb") as src:
                     f.write(src.read())
+
+            # Upload to OSS
+            if _oss and _oss.OSS_ENABLED and _oss.OSS_BUCKET:
+                date_str = (record.get("create_time", "") or "")[:10].replace("-", "")
+                oss_key = _oss.oss_key_for_archive("files", date_str, os.path.basename(archive_path))
+                if _oss.oss_upload(archive_path, oss_key, log_func=log_msg):
+                    archive_path = f"oss://{_oss.OSS_BUCKET}/{oss_key}"
+
+            # Check file size against Feishu limit
+            file_size = os.path.getsize(local)
+            ext = os.path.splitext(record["name"])[1].lower()
+            local_to_send = local
+
+            if file_size > FEISHU_FILE_MAX_SIZE and ext in AUDIO_EXTENSIONS:
+                try:
+                    compressed_path, _ = compress_audio_for_feishu(local, FEISHU_FILE_MAX_SIZE)
+                    if compressed_path != local:
+                        local_to_send = compressed_path
+                        log_msg(f"FILE_COMPRESSED: {key} {file_size/(1024*1024):.1f}MB -> {os.path.getsize(compressed_path)/(1024*1024):.1f}MB")
+                except Exception as comp_err:
+                    raise RuntimeError(f"Audio compression failed for {file_size/(1024*1024):.1f}MB file: {comp_err}")
+            elif file_size > FEISHU_FILE_MAX_SIZE:
+                raise RuntimeError(
+                    f"File too large ({file_size/(1024*1024):.1f}MB > {FEISHU_FILE_MAX_SIZE/(1024*1024)}MB), "
+                    f"not an audio file (ext={ext}), cannot compress"
+                )
+
             idempotency_key = "zsxq-file-" + key.replace(":", "-")
-            result = fs_send_file(local, idempotency_key=idempotency_key)
+            result = fs_send_file(local_to_send, idempotency_key=idempotency_key)
             if result["ok"]:
                 mark_file_sent(conn, key, archive_path)
                 sent += 1
@@ -1503,7 +1707,20 @@ def process_pending_files(conn, ztok):
         except Exception as exc:
             failed += 1
             mark_file_failed(conn, key, exc)
-            send_alert(f"飞书附件发送失败，file_key={key}，错误={str(exc)[:500]}")
+            retry_count = record.get("retry_count", 0) + 1
+            error_str = str(exc)
+            if retry_count >= FILE_MAX_RETRIES or "file size exceed" in error_str.lower():
+                try:
+                    conn.execute(
+                        "UPDATE files SET status='permanent_fail', last_error=? WHERE file_key=?",
+                        (f"Max retries ({FILE_MAX_RETRIES}) or unrecoverable: {error_str[:400]}", key)
+                    )
+                    conn.commit()
+                    log_msg(f"FILE_PERMANENT_FAIL: {key} retry_count={retry_count}, error={error_str[:200]}")
+                except Exception:
+                    pass
+            else:
+                send_alert(f"飞书附件发送失败，file_key={key}，错误={error_str[:500]}")
         finally:
             try:
                 os.remove(local)
@@ -1707,6 +1924,16 @@ def run_monitor(dry_run=False):
                 log_msg(f"DRY_RUN_FETCH_ERR: {exc}")
             else:
                 handle_fetch_error(conn, exc)
+            # Don't return - still process any pending topics/files already in DB
+            topic_sent, topic_failed = process_pending_topics(conn, ztok, group_name=footer_brand)
+            file_sent, file_failed = process_pending_files(conn, ztok)
+            update_sent, update_failed = process_updated_topics(conn, ztok, group_name=footer_brand)
+            set_meta(conn, "last_heartbeat", now_text())
+            log_msg(
+                f"RUN_DONE (fetch failed): topics sent={topic_sent}, topics failed={topic_failed}, "
+                f"topics updated={update_sent}, update_failed={update_failed}, "
+                f"files sent={file_sent}, files failed={file_failed}"
+            )
             return
 
         set_meta(conn, "consecutive_failures", 0)
@@ -1756,6 +1983,13 @@ def run_monitor(dry_run=False):
             check_disk_space(conn)
         except Exception as exc:
             log_msg(f"DISK_CHECK_ERR: {exc}")
+        if _oss and _oss.OSS_ENABLED:
+            try:
+                oss_ok = _oss.check_oss_health()
+                if oss_ok is False:
+                    log_msg("OSS_HEALTH: unreachable")
+            except Exception as exc2:
+                log_msg(f"OSS_HEALTH_ERR: {exc2}")
         try:
             send_daily_health_report(conn)
         except Exception as exc:

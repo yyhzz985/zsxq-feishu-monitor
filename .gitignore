@@ -18,6 +18,9 @@ logs/
 # 临时文件
 temp/
 *.tmp
+*.bak
+*.bak.*
+*.orig
 *.pyc
 __pycache__/
 
@@ -38,3 +41,6 @@ Thumbs.db
 # 部署包
 dist/
 *.zip
+
+# QQ bridge 本地验证截图，测试夹具除外
+qq-feishu-bridge/*.png

@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    environment:
+      - ACCOUNT=你的QQ号              # ← 替换成你的QQ号
+      - NAPCAT_GID=0
+      - NAPCAT_UID=0
+    ports:
+      - "6099:6099"                  # WebUI 管理界面
+      - "3001:3001"                  # WebSocket 正向连接端口
+      - "3000:3000"                  # HTTP API (可选，用于 get_image)
+    volumes:
+      - ./napcat_data:/app/.config/QQ
+    restart: unless-stopped
+    networks:
+      - qq-bridge-net
+
+  bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: qq-feishu-bridge
+    environment:
+      - NAPCAT_WS=ws://napcat:3001
+      - NAPCAT_HTTP=http://napcat:3000
+      - FEISHU_APP_ID=REPLACE_WITH_FEISHU_APP_ID
+      - FEISHU_APP_SECRET=REPLACE_WITH_FEISHU_APP_SECRET
+      - FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
+      - FEISHU_ALERT_CHAT_ID=oc_xxxxxxxxxxxx
+      - QQ_BRIDGE_DB=/app/data/qq_bridge.db
+      - QQ_BRIDGE_LOG=/app/logs/bridge.log
+      - OSS_ENABLED=0
+      - OSS_BUCKET=REPLACE_WITH_OSS_BUCKET
+      - OSS_ACCESS_KEY_ID=REPLACE_WITH_OSS_ACCESS_KEY_ID
+      - OSS_ACCESS_KEY_SECRET=REPLACE_WITH_OSS_ACCESS_KEY_SECRET
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
+    depends_on:
+      napcat:
+        condition: service_started
+    networks:
+      - qq-bridge-net
+
+networks:
+  qq-bridge-net:
+    driver: bridge

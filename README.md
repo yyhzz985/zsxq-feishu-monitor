@@ -2,6 +2,8 @@
 
 知识星球 → 飞书群 自动化内容推送系统。每分钟轮询指定星球的新帖，生成便签图，通过飞书 OpenAPI 推送到群。
 
+本仓库同时包含 QQ 群 → 飞书群转发系统，入口在 `qq-feishu-bridge/`。
+
 ## 项目结构
 
 ```
@@ -20,6 +22,11 @@
 │   ├── 本地定时任务_使用手册.md # Windows 本地开关指南
 │   ├── 开发日志.md             # 完整开发记录
 │   └── 部署与切换手册.md       # 部署与发送模式切换
+├── qq-feishu-bridge/           # QQ 群监控转发系统
+│   ├── qq_feishu_bridge.py      # Docker 多群桥接
+│   ├── bridge_wu2198.py         # wu2198 便签图桥接
+│   ├── deploy/                  # Docker 部署模板
+│   └── tests/                   # 单元测试与图片夹具
 └── .gitignore
 ```
 
@@ -75,6 +82,19 @@ Disable-ScheduledTask -TaskName 'ZSXQ-Feishu-Monitor'
 - **1059 自适应**：ZSXQ API 限流时自动退避重试，5 次 + 递增间隔
 - **多环境支持**：同一脚本同时支持 Linux systemd 和 Windows 任务计划
 - **故障自恢复**：锁文件 PID 检测自动清理，离线不丢帖不重复
+
+## QQ 群转发
+
+详见 `qq-feishu-bridge/README.md`。
+
+支持：
+
+- NapCat WebSocket 接入 QQ 群消息
+- 多 QQ 群映射到测试/正式飞书群
+- 图片、文件、语音转发
+- 指定群图片去水印
+- wu2198 便签图渲染转发
+- 测试群告警和正式群内容分离
 
 ## 配置
 
