@@ -11,6 +11,7 @@ except ImportError:
     _oss = None
 """ZSXQ -> note image -> watermark -> Feishu, with SQLite status tracking."""
 import json
+import hashlib
 import mimetypes
 import os
 import re
@@ -67,6 +68,7 @@ DISK_ALERT_FREE_BYTES = int(os.environ.get("ZSXQ_DISK_ALERT_GB", "10")) * 1024 *
 FEISHU_FILE_MAX_SIZE = int(os.environ.get("ZSXQ_FEISHU_FILE_MAX_MB", "30")) * 1024 * 1024
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".wma", ".opus", ".amr", ".m4b"}
 FILE_MAX_RETRIES = int(os.environ.get("ZSXQ_FILE_MAX_RETRIES", "5"))
+STALE_TOPIC_HOURS = int(os.environ.get("ZSXQ_UPDATE_STALE_HOURS", "24"))
 
 
 def now_text():
@@ -164,6 +166,53 @@ def row_to_dict(row):
     return data
 
 
+def compute_content_hash(topic):
+    text, images, files = extract_topic_content(topic)
+    payload = {
+        "text": text,
+        "image_ids": [str(item.get("image_id")) for item in images if item.get("image_id")],
+        "file_ids": [str(item.get("file_id")) for item in files if item.get("file_id")],
+        "file_names": [item.get("name", "") for item in files],
+    }
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def topic_update_is_recent(topic, now_epoch=None):
+    create_time = (topic.get("create_time", "") or "")[:19].replace("T", " ")
+    try:
+        created_epoch = time.mktime(time.strptime(create_time, "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return True
+    age_seconds = (now_epoch or time.time()) - created_epoch
+    return age_seconds <= STALE_TOPIC_HOURS * 60 * 60
+
+
+def ensure_topic_schema(conn):
+    columns = {row["name"] for row in conn.execute("pragma table_info(topics)").fetchall()}
+    if "content_hash" not in columns:
+        conn.execute("alter table topics add column content_hash text")
+    if "feishu_message_ids" not in columns:
+        conn.execute("alter table topics add column feishu_message_ids text")
+    conn.commit()
+
+
+def backfill_topic_hashes(conn):
+    rows = conn.execute(
+        """
+        select topic_id, topic_json from topics
+        where content_hash is null or content_hash = ''
+        """
+    ).fetchall()
+    for row in rows:
+        topic = json.loads(row["topic_json"])
+        conn.execute(
+            "update topics set content_hash = ? where topic_id = ?",
+            (compute_content_hash(topic), row["topic_id"]),
+        )
+    conn.commit()
+
+
 def init_db(db_path=DB_FILE):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -176,6 +225,8 @@ def init_db(db_path=DB_FILE):
             status text not null default 'discovered',
             archive_path text,
             feishu_message_id text,
+            content_hash text,
+            feishu_message_ids text,
             retry_count integer not null default 0,
             last_error text,
             created_at text not null,
@@ -209,6 +260,8 @@ def init_db(db_path=DB_FILE):
         )
         """
     )
+    ensure_topic_schema(conn)
+    backfill_topic_hashes(conn)
     conn.commit()
     return conn
 
@@ -236,29 +289,92 @@ def increment_meta_int(conn, key):
     return value
 
 
-def upsert_topic(conn, topic):
+def upsert_topic(conn, topic, allow_insert=True):
     tid = topic_id_key(topic["topic_id"])
     create_time = topic.get("create_time", "")
+    topic_json = json.dumps(topic, ensure_ascii=False)
+    content_hash = compute_content_hash(topic)
     ts = now_text()
+
+    row = conn.execute(
+        "select status, content_hash from topics where topic_id = ?",
+        (tid,),
+    ).fetchone()
+    if row is None:
+        if not allow_insert:
+            return False
+        conn.execute(
+            """
+            insert into topics(topic_id, create_time, topic_json, content_hash, status, created_at, updated_at)
+            values(?, ?, ?, ?, 'discovered', ?, ?)
+            """,
+            (tid, create_time, topic_json, content_hash, ts, ts),
+        )
+        conn.commit()
+        return True
+
+    if row["status"] == "sent":
+        old_hash = row["content_hash"]
+        if not old_hash:
+            conn.execute(
+                """
+                update topics
+                set topic_json = ?, content_hash = ?, updated_at = ?
+                where topic_id = ?
+                """,
+                (topic_json, content_hash, ts, tid),
+            )
+            conn.commit()
+            return False
+        if old_hash == content_hash:
+            return False
+        if not topic_update_is_recent(topic):
+            conn.execute(
+                """
+                update topics
+                set topic_json = ?,
+                    content_hash = ?,
+                    updated_at = ?
+                where topic_id = ?
+                """,
+                (topic_json, content_hash, ts, tid),
+            )
+            conn.commit()
+            return False
+        conn.execute(
+            """
+            update topics
+            set topic_json = ?,
+                content_hash = ?,
+                status = 'updated',
+                last_error = null,
+                updated_at = ?
+            where topic_id = ?
+            """,
+            (topic_json, content_hash, ts, tid),
+        )
+        conn.commit()
+        return True
+
     conn.execute(
         """
-        insert into topics(topic_id, create_time, topic_json, status, created_at, updated_at)
-        values(?, ?, ?, 'discovered', ?, ?)
-        on conflict(topic_id) do update set
-            topic_json = excluded.topic_json,
-            updated_at = excluded.updated_at
-        where topics.status != 'sent'
+        update topics
+        set topic_json = ?,
+            content_hash = ?,
+            updated_at = ?
+        where topic_id = ?
         """,
-        (tid, create_time, json.dumps(topic, ensure_ascii=False), ts, ts),
+        (topic_json, content_hash, ts, tid),
     )
     conn.commit()
+    return True
 
 
 def get_pending_topics(conn, limit=PENDING_TOPIC_LIMIT):
     rows = conn.execute(
         """
         select * from topics
-        where status in ('discovered', 'rendered', 'failed')
+        where status in ('discovered', 'rendered', 'failed', 'updated')
         order by create_time asc, retry_count asc
         limit ?
         """,
@@ -280,7 +396,7 @@ def mark_topic_rendered(conn, topic_id, archive_path):
     conn.commit()
 
 
-def mark_topic_sent(conn, topic_id, archive_path=None, feishu_message_id=None):
+def mark_topic_sent(conn, topic_id, archive_path=None, feishu_message_id=None, feishu_message_ids=None):
     ts = now_text()
     conn.execute(
         """
@@ -288,13 +404,25 @@ def mark_topic_sent(conn, topic_id, archive_path=None, feishu_message_id=None):
         set status = 'sent',
             archive_path = coalesce(?, archive_path),
             feishu_message_id = ?,
+            feishu_message_ids = coalesce(?, feishu_message_ids),
             last_error = null,
             updated_at = ?
         where topic_id = ?
         """,
-        (archive_path, feishu_message_id or "", ts, topic_id_key(topic_id)),
+        (archive_path, feishu_message_id or "", feishu_message_ids, ts, topic_id_key(topic_id)),
     )
     conn.commit()
+
+
+def feishu_message_ids_json(result):
+    message_ids = []
+    for item in result.get("results", []) if isinstance(result, dict) else []:
+        message_id = item.get("message_id")
+        if message_id:
+            message_ids.append({"chat_id": item.get("chat_id", ""), "message_id": message_id})
+    if not message_ids and isinstance(result, dict) and result.get("message_id"):
+        message_ids.append({"chat_id": result.get("chat_id", ""), "message_id": result["message_id"]})
+    return json.dumps(message_ids, ensure_ascii=False) if message_ids else None
 
 
 def mark_topic_failed(conn, topic_id, error):
@@ -1531,20 +1659,21 @@ def render_topic_note(topic, ztok, group_name=None):
 def process_topic_record(conn, record, ztok, group_name=None):
     tid = record["topic_id"]
     archive_path = record.get("archive_path")
+    was_updated = record.get("status") == "updated"
 
     local_missing = not archive_path or (
         not archive_path.startswith("oss://") and not os.path.exists(archive_path)
     )
-    if local_missing:
+    if local_missing and not was_updated:
         if archive_path and archive_path.startswith("oss://") and _oss and _oss.OSS_ENABLED:
             local_copy = os.path.join(TEMP_DIR, os.path.basename(archive_path))
             if _oss.oss_download(archive_path.replace(f"oss://{_oss.OSS_BUCKET}/", ""), local_copy, log_func=log_msg):
                 archive_path = local_copy
             else:
                 archive_path = None
-        if not archive_path or (not archive_path.startswith("oss://") and not os.path.exists(archive_path)):
-            topic = json.loads(record["topic_json"])
-            save_path, files = render_topic_note(topic, ztok, group_name=group_name)
+    if was_updated or not archive_path or (not archive_path.startswith("oss://") and not os.path.exists(archive_path)):
+        topic = json.loads(record["topic_json"])
+        save_path, files = render_topic_note(topic, ztok, group_name=group_name)
         upsert_file_records(conn, tid, topic.get("create_time", ""), files)
         mark_topic_rendered(conn, tid, save_path)
         archive_path = save_path
@@ -1554,8 +1683,9 @@ def process_topic_record(conn, record, ztok, group_name=None):
     idem_key = f"zsxq-topic-{topic_id_key(tid)}-v{int(time.time())}"
     result = fs_send_image(archive_path, idempotency_key=idem_key)
     if result["ok"]:
-        mark_topic_sent(conn, tid, archive_path, result.get("message_id"))
-        log_msg(f"TOPIC_SENT: {tid} {archive_path}")
+        mark_topic_sent(conn, tid, archive_path, result.get("message_id"), feishu_message_ids_json(result))
+        event = "TOPIC_RESENT" if was_updated else "TOPIC_SENT"
+        log_msg(f"{event}: {tid} {archive_path}")
         return True
 
     mark_topic_failed(conn, tid, result["error"])
@@ -1927,7 +2057,7 @@ def run_monitor(dry_run=False):
             # Don't return - still process any pending topics/files already in DB
             topic_sent, topic_failed = process_pending_topics(conn, ztok, group_name=footer_brand)
             file_sent, file_failed = process_pending_files(conn, ztok)
-            update_sent, update_failed = process_updated_topics(conn, ztok, group_name=footer_brand)
+            update_sent, update_failed = 0, 0
             set_meta(conn, "last_heartbeat", now_text())
             log_msg(
                 f"RUN_DONE (fetch failed): topics sent={topic_sent}, topics failed={topic_failed}, "
@@ -1963,8 +2093,14 @@ def run_monitor(dry_run=False):
             )
             return
 
+        new_topic_ids = set()
         for topic in new_topics:
+            new_topic_ids.add(topic_id_key(topic["topic_id"]))
             upsert_topic(conn, topic)
+
+        for topic in all_topics:
+            if topic_id_key(topic["topic_id"]) not in new_topic_ids:
+                upsert_topic(conn, topic, allow_insert=False)
 
         if latest_time and new_topics:
             cfg["last_seen_time"] = latest_time
