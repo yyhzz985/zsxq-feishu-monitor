@@ -9,8 +9,16 @@ Requirements: Python 3.6+, websockets, Pillow, Chinese fonts (wqy-microhei)
 Usage: Set env vars or edit config inline, then run.
 """
 
-import asyncio, json, os, ssl, time, uuid, urllib.request, urllib.error, io
+import asyncio, json, os, ssl, sys, time, uuid, urllib.request, urllib.error, io
 from PIL import Image, ImageDraw, ImageFont
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_SRC_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "src")
+for module_dir in (SCRIPT_DIR, REPO_SRC_DIR):
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+
+from note_renderer import NoteImage, NoteRenderRequest, render_note
 
 # OSS integration (disabled by default)
 try:
@@ -38,7 +46,6 @@ FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_CONTENT_CHATS = os.environ.get("FEISHU_CONTENT_CHATS", "").split(",")  # comma-separated chat_ids
 FEISHU_ALERT_CHAT = os.environ.get("FEISHU_ALERT_CHAT", "")
 FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
-NOTES_API = "https://notes.fangyuanxiaozhan.com/api"
 WATERMARK_TEXT = os.environ.get("WATERMARK_TEXT", "更新加V：237219265")
 FOOTER_BRAND = os.environ.get("FOOTER_BRAND", "wu2198")
 TEMP_DIR = os.environ.get("TEMP_DIR", "/tmp/qq_note_bridge")
@@ -180,33 +187,6 @@ def send_alert(text):
            {"receive_id": FEISHU_ALERT_CHAT, "msg_type": "text",
             "content": json.dumps({"text": "[NOTE Bridge] " + text}, ensure_ascii=False), "uuid": uid})
 
-# ---- Note Image Rendering ----
-def notes_export(markdown):
-    data = json.dumps({"markdown": markdown, "theme": "default",
-                       "footerBrand": FOOTER_BRAND, "footerVia": ""}).encode()
-    req = urllib.request.Request(f"{NOTES_API}/export", data=data,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60, context=ctx_ssl) as r:
-        return r.read()
-
-def notes_import_image(filepath):
-    with open(filepath, "rb") as f:
-        data = f.read()
-    boundary = "----Notes" + os.urandom(8).hex()
-    fname = os.path.basename(filepath)
-    CRLF = "\r\n"
-    parts = [
-        ("--" + boundary + CRLF).encode(),
-        ('Content-Disposition: form-data; name="image"; filename="' + fname + '"' + CRLF + 'Content-Type: image/png' + CRLF + CRLF).encode(),
-        data,
-        (CRLF + "--" + boundary + "--" + CRLF).encode(),
-    ]
-    body = b"".join(parts)
-    req = urllib.request.Request(f"{NOTES_API}/images/import", data=body,
-                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    with urllib.request.urlopen(req, timeout=30, context=ctx_ssl) as r:
-        return json.loads(r.read()).get("url", "")
-
 def add_watermark(image_bytes):
     """Add full-screen repeating diagonal watermark.
     IMPORTANT: Single text per tile → rotate → tile with spacing.
@@ -248,16 +228,19 @@ def add_watermark(image_bytes):
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def render_note_image(ctime_str, text_parts, image_urls):
-    """Render markdown → notes API → watermark → save to archive."""
-    md_parts = [ctime_str]
-    if text_parts:
-        md_parts.append(text_parts)
-    for url in image_urls:
-        md_parts.append(f"![image]({url})")
-    md = "\n\n".join(md_parts)
-
-    png = notes_export(md)
+def render_note_image(ctime_str, content_parts, note_images):
+    """Render ordered QQ message segments through the unified note renderer."""
+    md = "\n\n".join([ctime_str] + list(content_parts))
+    png = render_note(
+        NoteRenderRequest(
+            markdown=md,
+            footer_brand=FOOTER_BRAND,
+            source="wu2198",
+            images=tuple(note_images),
+        ),
+        logger=log,
+        on_fallback=send_alert,
+    )
     if not png:
         log("  notes export FAILED")
         return None
@@ -305,66 +288,72 @@ async def process_message(event):
     if isinstance(segs, str):
         if not segs.strip() or "http://" in segs or "https://" in segs:
             return
-        save_path = render_note_image(ctime, segs, [])
+        save_path = render_note_image(ctime, [segs], [])
         if save_path:
             fs_send_image_to_chats(save_path)
         return
 
-    text_parts = []
-    image_urls = []
+    content_parts = []
+    note_images = []
+    downloaded_image_paths = []
     files_to_send = []
 
-    for seg in segs:
-        t = seg.get("type", "")
-        d = seg.get("data", {})
+    try:
+        for seg in segs:
+            t = seg.get("type", "")
+            d = seg.get("data", {})
 
-        if t in ("forward", "json"):
-            return
-        if t == "xml" and "http" in str(d.get("data", "")).lower():
-            return
-
-        if t == "text":
-            txt = d.get("text", "")
-            if "http://" in txt or "https://" in txt:
+            if t in ("forward", "json"):
                 return
-            text_parts.append(txt)
-        elif t == "image":
-            url = d.get("url", "")
-            if url:
-                data = download_qq_url(url)
-                if data:
-                    fpath = os.path.join(TEMP_DIR, f"note_img_{os.urandom(4).hex()}.png")
-                    with open(fpath, "wb") as f:
-                        f.write(data)
-                    public_url = notes_import_image(fpath)
-                    if public_url:
-                        image_urls.append(public_url)
-                    try:
-                        os.remove(fpath)
-                    except:
-                        pass
-        elif t == "file" or t == "record":
-            url = d.get("url", "")
-            fname = d.get("file", "file")
-            if url and url.startswith("http"):
-                data = download_qq_url(url)
-                if data:
-                    fpath = os.path.join(TEMP_DIR, fname)
-                    with open(fpath, "wb") as f:
-                        f.write(data)
-                    files_to_send.append(fpath)
-        elif t == "at":
-            name = d.get("name", "") or ("@" + str(d.get("qq", "")))
-            text_parts.append("@" + name + " ")
-        elif t == "face":
-            text_parts.append("[emoji]")
+            if t == "xml" and "http" in str(d.get("data", "")).lower():
+                return
 
-    # Render note image with text + images
-    text = "\n".join(text_parts).strip() if text_parts else ""
-    if text or image_urls:
-        save_path = render_note_image(ctime, text, image_urls)
-        if save_path:
-            fs_send_image_to_chats(save_path)
+            if t == "text":
+                txt = d.get("text", "")
+                if "http://" in txt or "https://" in txt:
+                    return
+                content_parts.append(txt)
+            elif t == "image":
+                url = d.get("url", "")
+                if url:
+                    data = download_qq_url(url)
+                    if not data:
+                        raise RuntimeError("QQ image download failed: %s" % url)
+                    fpath = os.path.join(TEMP_DIR, f"note_img_{os.urandom(4).hex()}.png")
+                    downloaded_image_paths.append(fpath)
+                    with open(fpath, "wb") as f:
+                        f.write(data)
+                    marker = "note-local://wu2198-%s" % len(note_images)
+                    content_parts.append("![image](%s)" % marker)
+                    note_images.append(
+                        NoteImage(marker_url=marker, local_path=fpath, source_url=url)
+                    )
+            elif t == "file" or t == "record":
+                url = d.get("url", "")
+                fname = d.get("file", "file")
+                if url and url.startswith("http"):
+                    data = download_qq_url(url)
+                    if data:
+                        fpath = os.path.join(TEMP_DIR, fname)
+                        with open(fpath, "wb") as f:
+                            f.write(data)
+                        files_to_send.append(fpath)
+            elif t == "at":
+                name = d.get("name", "") or ("@" + str(d.get("qq", "")))
+                content_parts.append("@" + name + " ")
+            elif t == "face":
+                content_parts.append("[emoji]")
+
+        if content_parts:
+            save_path = render_note_image(ctime, content_parts, note_images)
+            if save_path:
+                fs_send_image_to_chats(save_path)
+    finally:
+        for fpath in downloaded_image_paths:
+            try:
+                os.remove(fpath)
+            except FileNotFoundError:
+                pass
 
     # Send files separately
     for fpath in files_to_send:

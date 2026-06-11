@@ -10,6 +10,8 @@ INSTALL_BASE="/opt"
 VENV_DIR="/opt/zsxq-monitor/venv"
 LOG_DIR="/var/log/zsxq-monitor"
 SOURCE_PY="$SCRIPT_DIR/../src/zsxq_monitor.py"
+NOTE_RENDERER_PY="$SCRIPT_DIR/../src/note_renderer.py"
+LOCAL_NOTES_FALLBACK_PY="$SCRIPT_DIR/../src/local_notes_fallback.py"
 
 # ── Color output ──
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -85,6 +87,8 @@ for inst_def in "${INSTANCES[@]}"; do
     # Copy script
     if [[ -f "$SOURCE_PY" ]]; then
         cp "$SOURCE_PY" "$INST_DIR/app/zsxq_monitor.py"
+        cp "$NOTE_RENDERER_PY" "$INST_DIR/app/note_renderer.py"
+        cp "$LOCAL_NOTES_FALLBACK_PY" "$INST_DIR/app/local_notes_fallback.py"
     else
         err "Source script not found: $SOURCE_PY"
         exit 1
@@ -171,7 +175,10 @@ for inst_def in "${INSTANCES[@]}"; do
     SAFE_NAME=$(echo "$NAME" | tr '.' '-')
     INST_DIR="$INSTALL_BASE/zsxq-monitor-$NAME"
     
-    if "$VENV_DIR/bin/python" -m py_compile "$INST_DIR/app/zsxq_monitor.py"; then
+    if "$VENV_DIR/bin/python" -m py_compile \
+        "$INST_DIR/app/zsxq_monitor.py" \
+        "$INST_DIR/app/note_renderer.py" \
+        "$INST_DIR/app/local_notes_fallback.py"; then
         info "  $NAME: compile OK"
     else
         err "  $NAME: compile FAILED"

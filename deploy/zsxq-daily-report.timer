@@ -1,0 +1,12 @@
+[Unit]
+Description=Run ZSXQ daily report at 05:00 Asia/Shanghai
+Requires=zsxq-daily-report.service
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=zsxq-daily-report.service
+
+[Install]
+WantedBy=timers.target

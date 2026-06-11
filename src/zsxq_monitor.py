@@ -28,6 +28,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
+from note_renderer import NoteImage, NoteRenderRequest, render_note
+
 CONFIG_FILE = os.environ.get(
     "ZSXQ_CONFIG_FILE", os.path.join(SCRIPTS_DIR, "zsxq_poller_config.json")
 )
@@ -46,9 +51,6 @@ os.makedirs(LOG_DIR, exist_ok=True)
 CTX = ssl.create_default_context()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-NOTES_API = "https://notes.fangyuanxiaozhan.com/api"
-NOTES_EXPORT = f"{NOTES_API}/export"
-NOTES_IMPORT = f"{NOTES_API}/images/import"
 WATERMARK_TEXT = os.environ.get("WATERMARK_TEXT", "更新加V：237219265")
 SAVE_BASE = os.environ.get("ZSXQ_SAVE_DIR", r"D:\财经课程更新\击球区小能手")
 DEFAULT_LARK_CLI = (
@@ -1393,59 +1395,6 @@ def is_access_block_error(error):
     return "1059" in text or "非官方工具" in text or "garden.zsxq.com/skill" in text
 
 
-# ---- Notes API ----
-def notes_import_image(filepath):
-    try:
-        boundary = "----FB" + os.urandom(8).hex()
-        with open(filepath, "rb") as f:
-            data = f.read()
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="image"; filename="{os.path.basename(filepath)}"\r\n'
-            f"Content-Type: image/png\r\n\r\n"
-        ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
-        r, status = http_post(
-            NOTES_IMPORT,
-            body,
-            {"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            30,
-        )
-        if status == 200:
-            return json.loads(r).get("url", "")
-        return ""
-
-
-    except Exception:
-        pass
-    return ""
-def notes_export(markdown_text, footer_brand="击球区小能手的星球"):
-    # Try remote notes API first, fallback to local Pillow renderer
-    try:
-        data, status = http_post(
-            NOTES_EXPORT,
-            json.dumps(
-                {
-                    "markdown": markdown_text,
-                    "theme": "default",
-                    "footerBrand": footer_brand,
-                    "footerVia": "",
-                }
-            ).encode(),
-            {"Content-Type": "application/json"},
-            15,  # reduced timeout for faster fallback
-        )
-        if status == 200:
-            return data
-    except Exception:
-        pass
-    # Fallback: local Pillow renderer
-    try:
-        from local_notes_fallback import local_notes_export
-        return local_notes_export(markdown_text, footer_brand)
-    except ImportError:
-        raise RuntimeError("NOTE_API_ERR: remote notes unavailable and local fallback not found")
-
-
 # ---- Save helpers ----
 def get_save_dir(post_create_time=None):
     if post_create_time:
@@ -1593,52 +1542,61 @@ def render_topic_note(topic, ztok, group_name=None):
     if text:
         md_parts.append(text)
 
-    img_urls = []
-    for img in images:
-        img_id = img.get("image_id")
-        if not img_id:
-            continue
-        local = os.path.join(TEMP_DIR, f"zsxq_{img_id}.png")
-        try:
+    note_images = []
+    downloaded_paths = []
+    try:
+        for index, img in enumerate(images):
+            img_id = img.get("image_id")
+            if not img_id:
+                continue
+            local = os.path.join(TEMP_DIR, "zsxq_%s_%s.png" % (img_id, os.urandom(4).hex()))
             zsxq_url = zsxq_image_url(img_id, ztok)
             if not zsxq_url:
                 raise RuntimeError(f"image url missing: {img_id}")
+            downloaded_paths.append(local)
             with open(local, "wb") as f:
                 f.write(http_get(zsxq_url))
-            public_url = notes_import_image(local)
-            if not public_url:
-                # Notes CDN unavailable, skip image (will show [图片] placeholder)
+            marker = "note-local://zsxq-%s-%s" % (index, img_id)
+            md_parts.append("![image](%s)" % marker)
+            note_images.append(
+                NoteImage(marker_url=marker, local_path=local, source_url=zsxq_url)
+            )
+
+        file_names = []
+        for item in files:
+            fname = item.get("name", "")
+            if not fname:
                 continue
-            img_urls.append(public_url)
-        finally:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in AUDIO_EXTENSIONS:
+                ftime = (item.get("create_time", "") or "")[:16].replace("-", "").replace("T", "").replace(":", "")
+                if ftime:
+                    file_names.append(f"[{ftime}_音频]")
+                else:
+                    file_names.append(fname)
+            else:
+                file_names.append(fname)
+        if file_names:
+            md_parts.append("\n📎 " + "、".join(file_names))
+
+        md_text = "\n\n".join(md_parts)
+        footer = group_name or "击球区小能手的星球"
+        note_png = render_note(
+            NoteRenderRequest(
+                markdown=md_text,
+                footer_brand=footer,
+                source="zsxq",
+                images=tuple(note_images),
+            ),
+            logger=log_msg,
+            on_fallback=send_alert,
+        )
+    finally:
+        for local in downloaded_paths:
             try:
                 os.remove(local)
             except FileNotFoundError:
                 pass
-
-    for url in img_urls:
-        md_parts.append(f"![image]({url})")
-
-    file_names = []
-    for item in files:
-        fname = item.get("name", "")
-        if not fname:
-            continue
-        ext = os.path.splitext(fname)[1].lower()
-        if ext in AUDIO_EXTENSIONS:
-            ftime = (item.get("create_time", "") or "")[:16].replace("-", "").replace("T", "").replace(":", "")
-            if ftime:
-                file_names.append(f"[{ftime}_音频]")
-            else:
-                file_names.append(fname)
-        else:
-            file_names.append(fname)
-    if file_names:
-        md_parts.append("\n📎 " + "、".join(file_names))
-
-    md_text = "\n\n".join(md_parts)
-    footer = group_name or "击球区小能手的星球"
-    note_png = notes_export(md_text, footer_brand=footer)
 
     # Pre-resize to reduce memory for watermark (critical on 2GB servers)
     import io as _io

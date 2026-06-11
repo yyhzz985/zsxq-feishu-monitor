@@ -1,0 +1,19 @@
+[Unit]
+Description=ZSXQ daily Markdown/PDF report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/zsxq-daily-report/app
+Environment=TZ=Asia/Shanghai
+Environment=ZSXQ_DAILY_ENV_FILE=/opt/zsxq-daily-report/config/.env
+EnvironmentFile=/opt/zsxq-daily-report/config/.env
+ExecStart=/opt/zsxq-daily-report/venv/bin/python /opt/zsxq-daily-report/app/zsxq_daily_report.py --date yesterday --send-to-feishu
+TimeoutStartSec=45min
+
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes

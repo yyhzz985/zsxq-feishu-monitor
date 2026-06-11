@@ -1,14 +1,18 @@
 import importlib.util
 import io
 import os
+import sys
 import tempfile
 import time
 import unittest
 import urllib.error
 from pathlib import Path
 
+from PIL import Image
+
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "src" / "zsxq_monitor.py"
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 
 
 def load_monitor_module():
@@ -257,6 +261,50 @@ class TopicUpdateTests(unittest.TestCase):
         self.assertEqual(row["status"], "sent")
         self.assertIn("old_img", row["topic_json"])
         self.assertEqual(self.monitor.get_pending_topics(self.conn), [])
+
+    def test_render_keeps_downloaded_image_until_unified_renderer_finishes(self):
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (80, 40), (250, 0, 0)).save(image_buffer, format="PNG")
+        note_buffer = io.BytesIO()
+        Image.new("RGB", (1200, 400), (254, 252, 246)).save(note_buffer, format="PNG")
+        captured = {}
+
+        original_url = self.monitor.zsxq_image_url
+        original_get = self.monitor.http_get
+        original_render = self.monitor.render_note
+        original_watermark = self.monitor.add_watermark
+        try:
+            self.monitor.zsxq_image_url = lambda _image_id, _token: "https://example.com/image.png"
+            self.monitor.http_get = lambda _url: image_buffer.getvalue()
+
+            def fake_render(request, logger=None, on_fallback=None):
+                captured["request"] = request
+                captured["exists_during_render"] = all(
+                    os.path.exists(item.local_path) for item in request.images
+                )
+                return note_buffer.getvalue()
+
+            self.monitor.render_note = fake_render
+            self.monitor.add_watermark = lambda data: data
+
+            save_path, _files = self.monitor.render_topic_note(
+                self.make_topic(images=[{"image_id": "img_new"}]),
+                "token",
+                group_name="击球区小能手的星球",
+            )
+        finally:
+            self.monitor.zsxq_image_url = original_url
+            self.monitor.http_get = original_get
+            self.monitor.render_note = original_render
+            self.monitor.add_watermark = original_watermark
+
+        request = captured["request"]
+        self.assertTrue(captured["exists_during_render"])
+        self.assertEqual(request.source, "zsxq")
+        self.assertEqual(len(request.images), 1)
+        self.assertIn(request.images[0].marker_url, request.markdown)
+        self.assertFalse(os.path.exists(request.images[0].local_path))
+        self.assertTrue(os.path.exists(save_path))
 
 
 if __name__ == "__main__":
