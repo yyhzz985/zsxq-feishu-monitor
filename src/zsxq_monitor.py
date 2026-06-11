@@ -138,8 +138,10 @@ def http_post(url, data=None, headers=None, timeout=60):
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=CTX) as resp:
             return resp.read(), resp.status
-    except urllib.error.HTTPError as exc:
-        return exc.read(), exc.code
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+        if hasattr(exc, 'read'):
+            return exc.read(), exc.code if hasattr(exc, 'code') else 0
+        raise RuntimeError(f'HTTP POST connection error: {exc}')
 
 
 def runtime_value(key, default=""):
@@ -1393,42 +1395,55 @@ def is_access_block_error(error):
 
 # ---- Notes API ----
 def notes_import_image(filepath):
-    boundary = "----FB" + os.urandom(8).hex()
-    with open(filepath, "rb") as f:
-        data = f.read()
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="image"; filename="{os.path.basename(filepath)}"\r\n'
-        f"Content-Type: image/png\r\n\r\n"
-    ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
-    r, status = http_post(
-        NOTES_IMPORT,
-        body,
-        {"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        30,
-    )
-    if status == 200:
-        return json.loads(r).get("url", "")
+    try:
+        boundary = "----FB" + os.urandom(8).hex()
+        with open(filepath, "rb") as f:
+            data = f.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="{os.path.basename(filepath)}"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        r, status = http_post(
+            NOTES_IMPORT,
+            body,
+            {"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            30,
+        )
+        if status == 200:
+            return json.loads(r).get("url", "")
+        return ""
+
+
+    except Exception:
+        pass
     return ""
-
-
 def notes_export(markdown_text, footer_brand="击球区小能手的星球"):
-    data, status = http_post(
-        NOTES_EXPORT,
-        json.dumps(
-            {
-                "markdown": markdown_text,
-                "theme": "default",
-                "footerBrand": footer_brand,
-                "footerVia": "",
-            }
-        ).encode(),
-        {"Content-Type": "application/json"},
-        60,
-    )
-    if status == 200:
-        return data
-    raise RuntimeError(f"NOTE_API_ERR: HTTP {status}")
+    # Try remote notes API first, fallback to local Pillow renderer
+    try:
+        data, status = http_post(
+            NOTES_EXPORT,
+            json.dumps(
+                {
+                    "markdown": markdown_text,
+                    "theme": "default",
+                    "footerBrand": footer_brand,
+                    "footerVia": "",
+                }
+            ).encode(),
+            {"Content-Type": "application/json"},
+            15,  # reduced timeout for faster fallback
+        )
+        if status == 200:
+            return data
+    except Exception:
+        pass
+    # Fallback: local Pillow renderer
+    try:
+        from local_notes_fallback import local_notes_export
+        return local_notes_export(markdown_text, footer_brand)
+    except ImportError:
+        raise RuntimeError("NOTE_API_ERR: remote notes unavailable and local fallback not found")
 
 
 # ---- Save helpers ----
@@ -1592,7 +1607,8 @@ def render_topic_note(topic, ztok, group_name=None):
                 f.write(http_get(zsxq_url))
             public_url = notes_import_image(local)
             if not public_url:
-                raise RuntimeError(f"note image import failed: {img_id}")
+                # Notes CDN unavailable, skip image (will show [图片] placeholder)
+                continue
             img_urls.append(public_url)
         finally:
             try:
@@ -2003,12 +2019,13 @@ def fetch_topics(gid, ztok, last_seen, alert_on_limit=True):
 
         if last_seen is not None:
             oldest = batch[-1]
-            if oldest.get("create_time", "") > last_seen:
-                end_time = oldest.get("create_time", "")
+            oldest_ct = oldest.get("create_time", "")
+            if oldest_ct <= last_seen:
+                break
+            else:
+                end_time = oldest_ct
                 if not end_time:
                     break
-            else:
-                break
         else:
             break
         time.sleep(0.5)
