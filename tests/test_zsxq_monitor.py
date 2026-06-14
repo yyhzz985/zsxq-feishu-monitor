@@ -306,6 +306,24 @@ class TopicUpdateTests(unittest.TestCase):
         self.assertFalse(os.path.exists(request.images[0].local_path))
         self.assertTrue(os.path.exists(save_path))
 
+    def test_attachment_filename_is_limited_by_utf8_bytes(self):
+        long_name = (
+            "GS-生益科技（600183.SS）— AI用覆铜板（CCL）产能扩张叠加产品结构向高端升级；"
+            "目标价上调至人民币217.6元；维持买入 "
+            "Shengyi Tech (600183.SS) AI CCL capacity expansion with mix upgrade to high-end products; "
+            "TP raised to Rmb217.6; maintain buy.pdf"
+        )
+
+        safe_name = self.monitor.safe_filename(long_name)
+        archive_path = self.monitor.unique_path(
+            self.temp_dir.name,
+            f"45544551455244828_{safe_name}",
+        )
+
+        self.assertLessEqual(len(safe_name.encode("utf-8")), 180)
+        self.assertLessEqual(len(os.path.basename(archive_path).encode("utf-8")), 180)
+        self.assertTrue(os.path.basename(archive_path).endswith(".pdf"))
+
 
 if __name__ == "__main__":
     unittest.main()

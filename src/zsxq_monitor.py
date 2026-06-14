@@ -71,6 +71,7 @@ FEISHU_FILE_MAX_SIZE = int(os.environ.get("ZSXQ_FEISHU_FILE_MAX_MB", "30")) * 10
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".wma", ".opus", ".amr", ".m4b"}
 FILE_MAX_RETRIES = int(os.environ.get("ZSXQ_FILE_MAX_RETRIES", "5"))
 STALE_TOPIC_HOURS = int(os.environ.get("ZSXQ_UPDATE_STALE_HOURS", "24"))
+FILENAME_MAX_BYTES = 180
 
 
 def now_text():
@@ -1419,18 +1420,40 @@ def make_note_name(create_time):
     return candidate + ".png"
 
 
-def safe_filename(name):
+def truncate_utf8(text, max_bytes):
+    data = str(text or "").encode("utf-8")
+    if len(data) <= max_bytes:
+        return str(text or "")
+    return data[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def safe_filename(name, max_bytes=FILENAME_MAX_BYTES):
     name = os.path.basename(name or "attachment")
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
-    return name[:180] or "attachment"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return "attachment"
+
+    base, ext = os.path.splitext(name)
+    if len(ext.encode("utf-8")) >= max_bytes:
+        ext = ""
+
+    base_max = max_bytes - len(ext.encode("utf-8"))
+    base = truncate_utf8(base or "attachment", base_max).strip(" .")
+    if not base:
+        base = truncate_utf8("attachment", base_max)
+    return (base + ext) or "attachment"
 
 
 def unique_path(directory, filename):
+    filename = safe_filename(filename)
     base, ext = os.path.splitext(filename)
     path = os.path.join(directory, filename)
     suffix = 1
     while os.path.exists(path):
-        path = os.path.join(directory, f"{base}_{suffix}{ext}")
+        suffix_text = f"_{suffix}"
+        base_max = FILENAME_MAX_BYTES - len(ext.encode("utf-8")) - len(suffix_text.encode("utf-8"))
+        safe_base = truncate_utf8(base, max(1, base_max)).strip(" .") or "attachment"
+        path = os.path.join(directory, f"{safe_base}{suffix_text}{ext}")
         suffix += 1
     return path
 

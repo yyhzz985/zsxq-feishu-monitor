@@ -631,6 +631,11 @@ def resolve_command(command: str) -> list[str]:
         candidate = Path(command)
         if candidate.exists():
             path = str(candidate)
+    command_name = Path(command).name.lower()
+    if not path and command_name in ("lark-cli", "lark-cli.cmd", "lark-cli.exe", "lark-cli.ps1"):
+        bundled = Path("/opt/zsxq-daily-report/lark-cli/node_modules/.bin/lark-cli")
+        if bundled.exists():
+            path = str(bundled)
     if not path:
         raise RuntimeError(f"command not found: {command}")
     if path.lower().endswith(".ps1"):
@@ -833,9 +838,14 @@ def upload_outputs(args: argparse.Namespace, outputs: list[DayOutput]) -> None:
     by_date = {item.date: item for item in outputs}
     upload_order = sorted(by_date, reverse=True)
     anchor_date = normalize_date(args.insert_before_date) if args.insert_before_date else None
+    document_files = fetch_feishu_document_files(args)
 
     for day in upload_order:
         item = by_date[day]
+        if document_files_contain_output(document_files, item):
+            item.uploaded = True
+            anchor_date = day
+            continue
         file_arg = ".\\" + item.pdf_path.name if os.name == "nt" else "./" + item.pdf_path.name
         cmd_args = [
             "docs",
@@ -860,13 +870,19 @@ def upload_outputs(args: argparse.Namespace, outputs: list[DayOutput]) -> None:
         payload = extract_first_json(result.stdout)
         item.uploaded = True
         item.file_token = str(payload.get("data", {}).get("file_token", ""))
+        document_files.append(
+            {
+                "title": item.pdf_path.name,
+                "size": str(item.pdf_path.stat().st_size),
+                "token": item.file_token,
+            }
+        )
         anchor_date = day
 
     verify_feishu_order(args, outputs)
 
 
-def verify_feishu_order(args: argparse.Namespace, outputs: list[DayOutput]) -> None:
-    expected_sizes = [str(item.pdf_path.stat().st_size) for item in sorted(outputs, key=lambda item: item.date)]
+def fetch_feishu_document_content(args: argparse.Namespace) -> str:
     result = run_lark(
         args.lark_cli,
         [
@@ -887,11 +903,103 @@ def verify_feishu_order(args: argparse.Namespace, outputs: list[DayOutput]) -> N
         ],
         Path.cwd(),
     )
-    actual_sizes = re.findall(r'mime="application/pdf" size="(\d+)"', result.stdout)
-    expected_joined = ",".join(expected_sizes)
-    actual_joined = ",".join(actual_sizes)
-    if expected_joined not in actual_joined:
-        raise RuntimeError(f"Feishu order verification failed: expected contiguous sizes {expected_joined}, got {actual_joined}")
+    return result.stdout
+
+
+def extract_attr(tag: str, name: str) -> str:
+    match = re.search(rf'\b{name}="([^"]*)"', tag)
+    return html.unescape(match.group(1)) if match else ""
+
+
+def extract_document_file_sources(document_content: str) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for source in re.findall(r"<source\b[^>]*>", document_content):
+        mime = extract_attr(source, "mime")
+        size = extract_attr(source, "size")
+        token = extract_attr(source, "token")
+        if token and size and mime in ("application/pdf", "file"):
+            sources.append({"token": token, "size": size, "mime": mime})
+    return sources
+
+
+def fetch_feishu_file_titles(args: argparse.Namespace, tokens: list[str]) -> dict[str, str]:
+    if not tokens:
+        return {}
+    payload = {
+        "request_docs": [
+            {
+                "doc_token": token,
+                "doc_type": "file",
+            }
+            for token in tokens
+        ]
+    }
+    result = run_lark(
+        args.lark_cli,
+        [
+            "drive",
+            "metas",
+            "batch_query",
+            "--as",
+            args.lark_as,
+            "--data",
+            json.dumps(payload, ensure_ascii=False),
+            "--format",
+            "json",
+        ],
+        Path.cwd(),
+    )
+    data = extract_first_json(result.stdout)
+    if data.get("code") not in (None, 0):
+        raise RuntimeError(f"Feishu metadata query failed: {result.stdout[:1000]}")
+    titles: dict[str, str] = {}
+    for item in data.get("data", {}).get("metas", []) or data.get("metas", []):
+        token = str(item.get("doc_token") or "")
+        title = str(item.get("title") or "")
+        if token and title:
+            titles[token] = title
+    return titles
+
+
+def fetch_feishu_document_files(args: argparse.Namespace) -> list[dict[str, str]]:
+    files = extract_document_file_sources(fetch_feishu_document_content(args))
+    titles = fetch_feishu_file_titles(args, [item["token"] for item in files])
+    for item in files:
+        item["title"] = titles.get(item["token"], "")
+    return files
+
+
+def document_files_contain_output(document_files: list[dict[str, str]], output: DayOutput) -> bool:
+    expected_size = str(output.pdf_path.stat().st_size)
+    expected_name = output.pdf_path.name
+    return any(item.get("title") == expected_name and item.get("size") == expected_size for item in document_files)
+
+
+def contains_contiguous_sequence(values: list[int], expected: list[int]) -> bool:
+    if not expected:
+        return True
+    length = len(expected)
+    return any(values[index : index + length] == expected for index in range(0, len(values) - length + 1))
+
+
+def verify_feishu_order(args: argparse.Namespace, outputs: list[DayOutput]) -> None:
+    ordered_outputs = sorted(outputs, key=lambda item: item.date)
+    expected_files = [(item.pdf_path.name, str(item.pdf_path.stat().st_size)) for item in ordered_outputs]
+    document_files = fetch_feishu_document_files(args)
+    matched_indexes: list[int] = []
+    for item in document_files:
+        for index, (expected_name, expected_size) in enumerate(expected_files):
+            if item.get("title") == expected_name and item.get("size") == expected_size:
+                matched_indexes.append(index)
+                break
+    expected_indexes = list(range(len(expected_files)))
+    if not contains_contiguous_sequence(matched_indexes, expected_indexes):
+        expected_desc = ", ".join(f"{name} size={size}" for name, size in expected_files)
+        actual_desc = " | ".join(
+            f"{item.get('title', '')} size={item.get('size', '')} token={item.get('token', '')}"
+            for item in document_files
+        ) or "<no document files>"
+        raise RuntimeError(f"Feishu order verification failed: expected PDF file sequence {expected_desc}, got {actual_desc}")
 
 
 def build_outputs(args: argparse.Namespace, client: ZsxqClient, dates: list[dt.date]) -> list[DayOutput]:
